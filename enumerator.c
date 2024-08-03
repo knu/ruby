@@ -165,6 +165,7 @@ static VALUE rb_cLazy;
 static ID id_rewind, id_new, id_to_enum, id_each_entry;
 static ID id_next, id_result, id_receiver, id_arguments, id_memo, id_method, id_force;
 static ID id_begin, id_end, id_step, id_exclude_end;
+static ID id_before, id_until;
 static VALUE sym_each, sym_cycle, sym_yield;
 
 static VALUE lazy_use_super_method;
@@ -222,6 +223,8 @@ struct yielder {
 struct producer {
     VALUE init;
     VALUE proc;
+    VALUE before_proc;
+    VALUE until_proc;
 };
 
 typedef struct MEMO *lazyenum_proc_func(VALUE, struct MEMO *, VALUE, long);
@@ -2918,6 +2921,8 @@ producer_mark(void *p)
     struct producer *ptr = p;
     rb_gc_mark_movable(ptr->init);
     rb_gc_mark_movable(ptr->proc);
+    rb_gc_mark_movable(ptr->before_proc);
+    rb_gc_mark_movable(ptr->until_proc);
 }
 
 static void
@@ -2926,6 +2931,8 @@ producer_compact(void *p)
     struct producer *ptr = p;
     ptr->init = rb_gc_location(ptr->init);
     ptr->proc = rb_gc_location(ptr->proc);
+    ptr->before_proc = rb_gc_location(ptr->before_proc);
+    ptr->until_proc = rb_gc_location(ptr->until_proc);
 }
 
 #define producer_free RUBY_TYPED_DEFAULT_FREE
@@ -2969,12 +2976,14 @@ producer_allocate(VALUE klass)
     obj = TypedData_Make_Struct(klass, struct producer, &producer_data_type, ptr);
     ptr->init = Qundef;
     ptr->proc = Qundef;
+    ptr->before_proc = Qundef;
+    ptr->until_proc = Qundef;
 
     return obj;
 }
 
 static VALUE
-producer_init(VALUE obj, VALUE init, VALUE proc)
+producer_init(VALUE obj, VALUE init, VALUE proc, VALUE before, VALUE until)
 {
     struct producer *ptr;
 
@@ -2986,6 +2995,27 @@ producer_init(VALUE obj, VALUE init, VALUE proc)
 
     RB_OBJ_WRITE(obj, &ptr->init, init);
     RB_OBJ_WRITE(obj, &ptr->proc, proc);
+
+    if (!UNDEF_P(before) && !NIL_P(before)) {
+        VALUE pred = before;
+        if (!rb_obj_is_proc(pred)) {
+            pred = rb_funcall(before, idTo_proc, 0);
+            if (!rb_obj_is_proc(pred)) {
+                rb_raise(rb_eTypeError, "wrong argument type %s (expected Proc)", rb_obj_classname(before));
+            }
+        }
+        RB_OBJ_WRITE(obj, &ptr->before_proc, pred);
+    }
+    if (!UNDEF_P(until) && !NIL_P(until)) {
+        VALUE pred = until;
+        if (!rb_obj_is_proc(pred)) {
+            pred = rb_funcall(until, idTo_proc, 0);
+            if (!rb_obj_is_proc(pred)) {
+                rb_raise(rb_eTypeError, "wrong argument type %s (expected Proc)", rb_obj_classname(until));
+            }
+        }
+        RB_OBJ_WRITE(obj, &ptr->until_proc, pred);
+    }
 
     return obj;
 }
@@ -3002,23 +3032,34 @@ static VALUE
 producer_each_i(VALUE obj)
 {
     struct producer *ptr;
-    VALUE init, proc, curr;
+    VALUE init, proc, before_proc, until_proc, curr;
 
     ptr = producer_ptr(obj);
     init = ptr->init;
     proc = ptr->proc;
+    before_proc = ptr->before_proc;
+    until_proc = ptr->until_proc;
 
     if (UNDEF_P(init)) {
         curr = Qnil;
-    }
-    else {
-        rb_yield(init);
+    } else {
         curr = init;
+        goto yield;
     }
 
     for (;;) {
         curr = rb_funcall(proc, id_call, 1, curr);
+
+      yield:
+        if (!UNDEF_P(before_proc) && RTEST(rb_funcall(before_proc, id_call, 1, curr))) {
+            rb_raise(rb_eStopIteration, "before condition is met");
+        }
+
         rb_yield(curr);
+
+        if (!UNDEF_P(until_proc) && RTEST(rb_funcall(until_proc, id_call, 1, curr))) {
+            rb_raise(rb_eStopIteration, "until condition is met");
+        }
     }
 
     UNREACHABLE_RETURN(Qnil);
@@ -3039,20 +3080,39 @@ producer_size(VALUE obj, VALUE args, VALUE eobj)
     return DBL2NUM(HUGE_VAL);
 }
 
+static VALUE
+producer_size_unknown(VALUE obj, VALUE args, VALUE eobj)
+{
+    return Qnil;
+}
+
 /*
  * call-seq:
- *    Enumerator.produce(initial = nil) { |prev| block } -> enumerator
+ *    Enumerator.produce(initial = nil, before: nil, until: nil) { |prev| block } -> enumerator
  *
- * Creates an infinite enumerator from any block, just called over and
- * over.  The result of the previous iteration is passed to the next one.
- * If +initial+ is provided, it is passed to the first iteration, and
- * becomes the first element of the enumerator; if it is not provided,
- * the first iteration receives +nil+, and its result becomes the first
- * element of the iterator.
+ * Creates an enumerator that generates a sequence of values from a
+ * block that is called over and over.  The result of the previous
+ * iteration is passed to the next one.  If +initial+ is provided, it
+ * is passed to the first iteration, and becomes the first element of
+ * the enumerator; if it is not provided, the first iteration receives
+ * +nil+, and its result becomes the first element of the iterator.
  *
- * Raising StopIteration from the block stops an iteration.
+ * If +before+ is provided, it is used as a predicate to determine if
+ * an iteration should end before a generated value gets yielded.
+ *
+ * If +until+ is provided, it is used as a predicate to determine if
+ * an iteration should end after a generated value gets yielded.
+ *
+ * Any value that responds to +to_proc+ and returns a +Proc+ object is
+ * accepted in these options.
+ *
+ * Raising StopIteration from the block also stops an iteration.
  *
  *   Enumerator.produce(1, &:succ)   # => enumerator of 1, 2, 3, 4, ....
+ *
+ *   Enumerator.produce(File, before: :nil?, &:superclass)  # => enumerator of File, IO, Object, BasicObject
+ *
+ *   Enumerator.produce(3, until: :zero?, &:pred)  # => enumerator of 3, 2, 1, 0
  *
  *   Enumerator.produce { rand(10) } # => infinite random number sequence
  *
@@ -3077,17 +3137,31 @@ producer_size(VALUE obj, VALUE args, VALUE eobj)
 static VALUE
 enumerator_s_produce(int argc, VALUE *argv, VALUE klass)
 {
-    VALUE init, producer;
+    VALUE init, producer, options, proc, before = Qundef, until = Qundef;
 
     if (!rb_block_given_p()) rb_raise(rb_eArgError, "no block given");
 
-    if (rb_scan_args(argc, argv, "01", &init) == 0) {
+    if (rb_scan_args(argc, argv, "01:&", &init, &options, &proc) == 0) {
         init = Qundef;
     }
 
-    producer = producer_init(producer_allocate(rb_cEnumProducer), init, rb_block_proc());
+    if (!NIL_P(options)) {
+        ID keys[2];
+        VALUE values[2];
+        keys[0] = id_before;
+        keys[1] = id_until;
+        rb_get_kwargs(options, keys, 0, 2, values);
+        before = values[0];
+        until = values[1];
+    }
 
-    return rb_enumeratorize_with_size_kw(producer, sym_each, 0, 0, producer_size, RB_NO_KEYWORDS);
+    producer = producer_init(producer_allocate(rb_cEnumProducer), init, proc, before, until);
+
+    return rb_enumeratorize_with_size_kw(
+        producer, sym_each, 0, 0,
+        before == Qundef && until == Qundef ? producer_size : producer_size_unknown,
+        RB_NO_KEYWORDS
+    );
 }
 
 /*
@@ -4678,6 +4752,8 @@ Init_Enumerator(void)
     id_end = rb_intern_const("end");
     id_step = rb_intern_const("step");
     id_exclude_end = rb_intern_const("exclude_end");
+    id_before = rb_intern_const("before");
+    id_until = rb_intern_const("until");
     sym_each = ID2SYM(id_each);
     sym_cycle = ID2SYM(rb_intern_const("cycle"));
     sym_yield = ID2SYM(rb_intern_const("yield"));
